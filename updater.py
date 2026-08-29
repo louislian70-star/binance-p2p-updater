@@ -7,14 +7,14 @@ from curl_cffi import requests as curl_req
 import requests
 
 # ==========================================================
-# CREDENCIALES (Inyectadas desde GitHub Secrets)
+# CREDENCIALES (GitHub Secrets)
 # ==========================================================
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_KV_NAMESPACE_ID = os.environ.get("CF_KV_NAMESPACE_ID", "")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 
 # ==========================================================
-# LOS 6 DATOS EXACTOS CONFIGURADOS CON IDS VERIFICADOS
+# ÚNICAMENTE TUS 6 DATOS (Sin otros países ni métodos extra)
 # ==========================================================
 QUERIES = [
     {
@@ -42,7 +42,7 @@ QUERIES = [
         "fiat": "VES",
         "asset": "USDT",
         "tradeType": "BUY",
-        "payTypes": [],  # Lista vacía = consulta general sin filtrar banco
+        "payTypes": [],  # General: todos los bancos
         "key": "VES_General"
     },
     {
@@ -62,18 +62,12 @@ QUERIES = [
 ]
 
 BINANCE_URL = "https://p2p.binance.com/bapi/c2c/v2/friendly/c2c/adv/search"
-
-# ==========================================================
-# PROTECCIONES ANTI-BLOQUEO
-# ==========================================================
 IMPERSONATE_OPTIONS = ["chrome120", "chrome124", "chrome131"]
 
 def random_delay():
-    """Pausa aleatoria entre 2.5 y 4.5 segundos para no crear patrones."""
     time.sleep(random.uniform(2.5, 4.5))
 
 def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
-    """Petición con suplantación de huella TLS y reintentos automáticos."""
     payload = {
         "page": 1,
         "rows": 20,
@@ -87,12 +81,10 @@ def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
 
     for attempt in range(1, max_retries + 1):
         try:
-            chosen_fingerprint = random.choice(IMPERSONATE_OPTIONS)
-
             response = curl_req.post(
                 BINANCE_URL,
                 json=payload,
-                impersonate=chosen_fingerprint,
+                impersonate=random.choice(IMPERSONATE_OPTIONS),
                 timeout=15,
                 headers={
                     "Accept": "application/json",
@@ -107,23 +99,12 @@ def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
                 data = response.json()
                 if data.get("success") and data.get("data"):
                     return data
-                else:
-                    print(f"  ⚠️ Intento {attempt}: Binance respondió success=false")
-            elif response.status_code == 429:
-                wait_time = 10 * attempt
-                print(f"  ⚠️ Rate Limit (429). Esperando {wait_time}s...")
-                time.sleep(wait_time)
+            elif response.status_code in [403, 429]:
+                time.sleep(10 * attempt)
                 continue
-            elif response.status_code == 403:
-                wait_time = 15 * attempt
-                print(f"  ⚠️ Bloqueo temporal (403). Esperando {wait_time}s...")
-                time.sleep(wait_time)
-                continue
-            else:
-                print(f"  ⚠️ Intento {attempt}: Código HTTP {response.status_code}")
 
         except Exception as e:
-            print(f"  ⚠️ Intento {attempt}: Error de conexión: {e}")
+            pass
 
         if attempt < max_retries:
             time.sleep(4 * attempt)
@@ -131,7 +112,6 @@ def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
     return None
 
 def process_ads(raw_data):
-    """Filtra anuncios sospechosos y calcula mejor precio y promedio real."""
     ads = raw_data.get("data", [])
     if not ads:
         return None
@@ -144,7 +124,7 @@ def process_ads(raw_data):
         finish_rate = advertiser.get("monthFinishRate", 0) * 100
         order_count = advertiser.get("monthOrderCount", 0)
 
-        # Filtro de calidad: solo comerciantes con historial confiable
+        # Filtro de reputación para evitar estafas
         if finish_rate >= 95.0 and order_count >= 10:
             try:
                 price = float(adv.get("price", 0))
@@ -158,7 +138,6 @@ def process_ads(raw_data):
 
     valid_prices.sort()
 
-    # Promedio recortado (elimina extremos para evitar outliers)
     if len(valid_prices) >= 4:
         trimmed = valid_prices[1:-1]
         avg_price = round(statistics.mean(trimmed), 2)
@@ -174,7 +153,6 @@ def process_ads(raw_data):
     }
 
 def upload_to_cloudflare_kv(data):
-    """Guarda todo el resultado en un único registro en Cloudflare KV."""
     url = (
         f"https://api.cloudflare.com/client/v4/accounts/"
         f"{CF_ACCOUNT_ID}/storage/kv/namespaces/"
@@ -191,24 +169,17 @@ def upload_to_cloudflare_kv(data):
             headers=headers,
             timeout=15
         )
-        result = response.json()
-        if result.get("success"):
-            print("✅ Precios guardados exitosamente en Cloudflare KV.")
-            return True
-        else:
-            print(f"❌ Error en la API de Cloudflare: {result}")
-            return False
-    except Exception as e:
-        print(f"🚨 Error al subir a Cloudflare: {e}")
+        return response.json().get("success", False)
+    except:
         return False
 
 def main():
-    print("=" * 55)
-    print(f"🕐 Iniciando ciclo: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
-    print("=" * 55)
+    print("=" * 50)
+    print(f"🕐 Actualizando solo 6 tasas: {time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime())}")
+    print("=" * 50)
 
     if not all([CF_ACCOUNT_ID, CF_KV_NAMESPACE_ID, CF_API_TOKEN]):
-        print("🚨 Error: Faltan credenciales en los Secrets del repositorio.")
+        print("🚨 Faltan credenciales en GitHub Secrets.")
         return
 
     result = {
@@ -218,38 +189,34 @@ def main():
         "prices": {}
     }
 
-    success_count = 0
-    total_queries = len(QUERIES)
-
+    ok = 0
     for q in QUERIES:
         key = q["key"]
-        method_label = q["payTypes"][0] if q["payTypes"] else "GENERAL (TODOS)"
-        print(f"\n🔄 Consultando [{q['fiat']}] USDT vía {method_label}...")
+        print(f"🔄 Consultando {key}...")
 
         raw = fetch_with_retry(q["fiat"], q["asset"], q["tradeType"], q["payTypes"])
-
         if raw:
             processed = process_ads(raw)
             if processed:
                 result["prices"][key] = processed
-                success_count += 1
-                print(f"   ✅ Mejor: {processed['best']} | Prom: {processed['avg']} | Anuncios analizados: {processed['count']}")
+                ok += 1
+                print(f"   ✅ Mejor: {processed['best']} | Promedio: {processed['avg']}")
             else:
-                print(f"   ⚠️ No se encontraron anuncios que cumplan el filtro de seguridad.")
+                print(f"   ⚠️ Sin anuncios calificados")
         else:
-            print(f"   ❌ Falló la consulta tras los reintentos.")
+            print(f"   ❌ Error al consultar Binance")
 
         random_delay()
 
-    print(f"\n{'=' * 55}")
-    print(f"📊 Resultado: {success_count}/{total_queries} consultas exitosas.")
+    print(f"\n📊 Resultado: {ok}/6 exitosas")
 
-    if success_count > 0:
-        upload_to_cloudflare_kv(result)
+    if ok > 0:
+        if upload_to_cloudflare_kv(result):
+            print("🚀 Guardado con éxito en Cloudflare KV.")
+        else:
+            print("❌ Error al guardar en Cloudflare.")
     else:
-        print("⚠️ No se subieron datos porque ninguna consulta tuvo éxito.")
-
-    print("🏁 Ejecución finalizada.")
+        print("⚠️ No hubo datos para guardar.")
 
 if __name__ == "__main__":
     main()
