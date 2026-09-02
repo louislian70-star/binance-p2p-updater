@@ -6,6 +6,8 @@ ACTUALIZADOR DE TASA OFICIAL BCV (USD y EUR)
 - Opción 2: Respaldo vía DolarApi (si BCV está caído)
 - Lógica de 2 tasas: VIGENTE (hoy) + PRÓXIMA (mañana/lunes)
 - Promoción automática a medianoche de Venezuela (UTC-4)
+- Precisión: valores TRUNCADOS a exactamente 4 decimales
+  (sin redondeo, fieles al formato del BCV)
 - Anti-ceros: si ambas fuentes fallan, NO toca la BD
 - Protege precios P2P y maneja compatibilidad de datos viejos
 =============================================================
@@ -44,12 +46,47 @@ def hoy_vet_iso():
     return datetime.now(VET).strftime("%Y-%m-%d")
 
 
-def normalizar_numero(texto):
-    """Convierte '794,99170000' en 794.99"""
+def normalizar_numero(texto_o_numero):
+    """
+    Devuelve el valor con EXACTAMENTE 4 decimales, TRUNCADO.
+
+    NUNCA redondea: corta el texto en el 4to decimal.
+    El corte se hace manipulando TEXTO (no multiplicaciones)
+    para evitar errores de precisión de punto flotante.
+
+    Ejemplos:
+      '801,1752'     -> 801.1752  (idéntico al BCV)
+      '794,99170000' -> 794.9917  (ceros sobrantes descartados)
+      '922,69121677' -> 922.6912  (NO 922.6913: truncado, no redondeado)
+      '801,17'       -> 801.17    (si trae menos decimales, se respeta)
+    """
     try:
-        limpio = texto.strip().replace(" ", "").replace(",", ".")
-        valor = float(limpio)
-        return round(valor, 2) if valor > 0 else None
+        # Normalizar: quitar espacios, coma -> punto
+        texto = str(texto_o_numero).strip().replace(" ", "").replace(",", ".")
+
+        if not texto:
+            return None
+
+        # Validar que sea un número positivo real
+        valor = float(texto)
+        if valor <= 0:
+            return None
+
+        # --------------------------------------------------
+        # CORTE POR TEXTO en el 4to decimal (sin redondear)
+        # --------------------------------------------------
+        if "." in texto:
+            entero, decimales = texto.split(".", 1)
+            # Conservar solo dígitos en la parte decimal
+            decimales_digitos = "".join(ch for ch in decimales if ch.isdigit())
+            # Cortar en 4; rellenar con ceros si faltan
+            decimales_cortadas = (decimales_digitos + "0000")[:4]
+        else:
+            # Sin parte decimal: completar con 4 ceros
+            decimales_cortadas = "0000"
+
+        return float(f"{entero}.{decimales_cortadas}")
+
     except Exception:
         return None
 
@@ -92,17 +129,23 @@ def parsear_fecha_bcv(soup):
 # ==========================================================
 
 def scrape_bcv_oficial():
+    """
+    Scrapea la página oficial del BCV (bcv.org.ve).
+    Extrae USD, EUR y Fecha Valor directamente del HTML.
+    Usa curl_cffi para simular Chrome real y evitar bloqueos SSL.
+    """
     print("🔍 [Opción 1] Scraping directo a bcv.org.ve...")
     try:
         res = curl_req.get(
             BCV_URL,
             impersonate="chrome120",
             timeout=25,
-            verify=False,
+            verify=False,  # El BCV tiene problemas frecuentes de certificado SSL
             headers={
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
                 "Accept-Language": "es-ES,es;q=0.9",
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
             }
         )
 
@@ -113,30 +156,33 @@ def scrape_bcv_oficial():
         soup = BeautifulSoup(res.text, "html.parser")
         tasas = {}
 
-        # Dólar (div#dolar)
+        # --- Extraer Dólar (div#dolar > strong.strong-tb) ---
         div_usd = soup.find("div", id="dolar")
         if div_usd:
             tag = div_usd.find("strong", class_="strong-tb") or div_usd.find("strong")
             if tag:
                 tasas["usd"] = normalizar_numero(tag.get_text())
 
-        # Euro (div#euro)
+        # --- Extraer Euro (div#euro > strong.strong-tb) ---
         div_eur = soup.find("div", id="euro")
         if div_eur:
             tag = div_eur.find("strong", class_="strong-tb") or div_eur.find("strong")
             if tag:
                 tasas["eur"] = normalizar_numero(tag.get_text())
 
-        # Fecha Valor
+        # --- Extraer Fecha Valor ---
         fecha_iso, fecha_texto = parsear_fecha_bcv(soup)
         if fecha_iso:
             tasas["fecha_valor"] = fecha_iso
             tasas["fecha_valor_texto"] = fecha_texto or fecha_iso
 
+        # Validar que tenemos ambos valores y la fecha
         if tasas.get("usd") and tasas.get("eur") and tasas.get("fecha_valor"):
             tasas["fuente"] = "BCV_Scraping_Directo"
             print(f"  ✅ USD: {tasas['usd']} | EUR: {tasas['eur']} | Fecha: {tasas['fecha_valor_texto']}")
             return tasas
+
+        print(f"  ⚠️ Datos incompletos del scraping: {list(tasas.keys())}")
 
     except Exception as e:
         print(f"  ⚠️ Error en scraping: {e}")
@@ -149,22 +195,35 @@ def scrape_bcv_oficial():
 # ==========================================================
 
 def fetch_dolarapi_respaldo():
+    """
+    Fuente de respaldo cuando el BCV está caído.
+    DolarApi Venezuela: https://ve.dolarapi.com
+
+    Usa la MISMA función normalizar_numero que el scraping
+    (truncado a 4 decimales) para mantener consistencia total
+    de precisión entre ambas fuentes.
+    """
     print("🔄 [Opción 2 - Respaldo] Consultando DolarApi...")
     try:
         tasas = {}
 
+        # Dólar oficial
         res_usd = requests.get("https://ve.dolarapi.com/v1/dolares/oficial", timeout=10)
         if res_usd.status_code == 200:
             usd_val = res_usd.json().get("promedio")
             if usd_val and float(usd_val) > 0:
-                tasas["usd"] = round(float(usd_val), 2)
+                # Truncado a 4 decimales (mismo criterio que el scraping)
+                tasas["usd"] = normalizar_numero(usd_val)
 
+        # Euro oficial
         res_eur = requests.get("https://ve.dolarapi.com/v1/euros/oficial", timeout=10)
         if res_eur.status_code == 200:
             eur_val = res_eur.json().get("promedio")
             if eur_val and float(eur_val) > 0:
-                tasas["eur"] = round(float(eur_val), 2)
+                # Truncado a 4 decimales (mismo criterio que el scraping)
+                tasas["eur"] = normalizar_numero(eur_val)
 
+        # Validar que obtuvimos ambos valores válidos
         if tasas.get("usd") and tasas.get("eur"):
             tasas["fuente"] = "DolarApi_Respaldo"
             tasas["fecha_valor"] = hoy_vet_iso()
@@ -179,10 +238,11 @@ def fetch_dolarapi_respaldo():
 
 
 # ==========================================================
-# CLOUDFLARE KV
+# CLOUDFLARE KV: LECTURA Y ESCRITURA
 # ==========================================================
 
 def read_kv():
+    """Lee el JSON completo actual de Cloudflare KV."""
     url = (
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
         f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/LATEST_PRICES"
@@ -198,6 +258,7 @@ def read_kv():
 
 
 def write_kv(data):
+    """Guarda el JSON completo en Cloudflare KV (1 sola escritura)."""
     url = (
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
         f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/LATEST_PRICES"
@@ -219,7 +280,7 @@ def write_kv(data):
 
 
 # ==========================================================
-# FLUJO PRINCIPAL
+# FLUJO PRINCIPAL (Lógica de 2 tasas: VIGENTE + PRÓXIMA)
 # ==========================================================
 
 def main():
@@ -232,7 +293,10 @@ def main():
         print("🚨 Faltan credenciales en GitHub Secrets.")
         return
 
-    # 1. Leer estado actual de KV y normalizar tipos (escudo de compatibilidad)
+    # -------------------------------------------------------
+    # 1. Leer estado actual de KV y normalizar tipos
+    #    (escudo de compatibilidad contra formatos viejos)
+    # -------------------------------------------------------
     kv_data = read_kv()
     if not isinstance(kv_data, dict):
         kv_data = {"success": True, "prices": {}}
@@ -249,13 +313,18 @@ def main():
     if not isinstance(eur_actual, dict):
         eur_actual = {}
 
-    # 2. Promoción automática a medianoche de Venezuela
+    # -------------------------------------------------------
+    # 2. PROMOCIÓN AUTOMÁTICA
+    #    Si hoy (VET) >= fecha_proxima, la próxima se convierte
+    #    en la vigente. Ocurre a medianoche de Venezuela.
+    # -------------------------------------------------------
     hoy = hoy_vet_iso()
     fecha_proxima_usd = usd_actual.get("fecha_proxima")
     if fecha_proxima_usd and hoy >= fecha_proxima_usd:
         print(f"\n⏰ PROMOCIÓN AUTOMÁTICA:")
         print(f"   La tasa próxima ({usd_actual.get('proxima')}) ahora es la vigente.")
 
+        # Promover USD
         usd_actual["vigente"] = usd_actual.get("proxima")
         usd_actual["fecha_vigente"] = usd_actual.get("fecha_proxima")
         usd_actual["fecha_vigente_texto"] = usd_actual.get("fecha_proxima_texto", "")
@@ -263,6 +332,7 @@ def main():
         usd_actual["fecha_proxima"] = None
         usd_actual["fecha_proxima_texto"] = None
 
+        # Promover EUR (misma fecha)
         eur_actual["vigente"] = eur_actual.get("proxima")
         eur_actual["fecha_vigente"] = eur_actual.get("fecha_proxima")
         eur_actual["fecha_vigente_texto"] = eur_actual.get("fecha_proxima_texto", "")
@@ -270,17 +340,23 @@ def main():
         eur_actual["fecha_proxima"] = None
         eur_actual["fecha_proxima_texto"] = None
 
+    # -------------------------------------------------------
     # 3. Obtener tasas frescas (Scraping -> Respaldo)
+    # -------------------------------------------------------
     tasas_frescas = scrape_bcv_oficial()
     if not tasas_frescas:
         tasas_frescas = fetch_dolarapi_respaldo()
 
-    # 4. Procesar tasas
+    # -------------------------------------------------------
+    # 4. Procesar las tasas frescas
+    # -------------------------------------------------------
     if tasas_frescas and tasas_frescas.get("usd", 0) > 0 and tasas_frescas.get("eur", 0) > 0:
+
         fecha_scraped = tasas_frescas.get("fecha_valor", "")
         fecha_vigente_actual = usd_actual.get("fecha_vigente", "")
 
         if not fecha_vigente_actual:
+            # Primera ejecución: todo es vigente
             print("\n📌 Estableciendo tasas iniciales:")
             usd_actual["vigente"] = tasas_frescas["usd"]
             usd_actual["fecha_vigente"] = fecha_scraped
@@ -297,6 +373,8 @@ def main():
             eur_actual["fecha_proxima_texto"] = None
 
         elif fecha_scraped > fecha_vigente_actual:
+            # La fecha del scraping es FUTURA respecto a la vigente
+            # -> El BCV ya publicó la tasa de mañana/lunes
             print(f"\n📢 NUEVA TASA DETECTADA (Próxima):")
             print(f"   Vigente: {usd_actual.get('vigente')} ({fecha_vigente_actual})")
             print(f"   Próxima: {tasas_frescas['usd']} ({fecha_scraped})")
@@ -310,17 +388,26 @@ def main():
             eur_actual["fecha_proxima_texto"] = tasas_frescas.get("fecha_valor_texto", fecha_scraped)
 
         elif fecha_scraped == fecha_vigente_actual:
+            # Misma fecha: actualizar valores numéricos de la vigente
+            # (el BCV puede ajustar decimales durante el día)
             usd_actual["vigente"] = tasas_frescas["usd"]
             eur_actual["vigente"] = tasas_frescas["eur"]
             print(f"\n🔄 Misma fecha ({fecha_scraped}): valores vigentes actualizados.")
 
+        # Registrar la fuente utilizada
         bcv_actual["fuente"] = tasas_frescas.get("fuente", "desconocida")
 
     else:
+        # -------------------------------------------------------
+        # ESCUDO ANTI-CEROS: Ambas fuentes fallaron
+        # No tocar la base de datos. Mantener lo que había.
+        # -------------------------------------------------------
         print("\n⚠️ No se pudieron obtener tasas frescas.")
         print("🛡️ PROTECCIÓN ACTIVA: Se conservan las tasas previas.")
 
-    # 5. Guardar en Cloudflare KV
+    # -------------------------------------------------------
+    # 5. Guardar en Cloudflare KV (merge con P2P)
+    # -------------------------------------------------------
     bcv_actual["usd"] = usd_actual
     bcv_actual["eur"] = eur_actual
     kv_data["bcv"] = bcv_actual
