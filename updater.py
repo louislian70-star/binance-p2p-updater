@@ -2,11 +2,11 @@
 =============================================================
 ACTUALIZADOR DE PRECIOS BINANCE P2P
 =============================================================
-- Consulta 6 pares de monedas en Binance P2P
-- Filtra comerciantes con >95% de reputación y >10 órdenes
-- Protege la sección del BCV (no la borra al guardar)
-- Si una consulta falla, mantiene el precio anterior (anti-ceros)
-- Se ejecuta cada 15 minutos vía GitHub Actions
+- Consulta 6 pares en Binance P2P
+- Filtra estafadores (reputación >=95%, órdenes >=10)
+- Mantiene histórico de precios si una consulta individual falla
+- Guarda exclusivamente en la clave: P2P_DATA
+- No toca ni depende del BCV
 =============================================================
 """
 
@@ -18,16 +18,12 @@ import statistics
 from curl_cffi import requests as curl_req
 import requests
 
-# ==========================================================
-# CREDENCIALES (inyectadas desde GitHub Secrets, nunca hardcodeadas)
-# ==========================================================
 CF_ACCOUNT_ID = os.environ.get("CF_ACCOUNT_ID", "")
 CF_KV_NAMESPACE_ID = os.environ.get("CF_KV_NAMESPACE_ID", "")
 CF_API_TOKEN = os.environ.get("CF_API_TOKEN", "")
 
-# ==========================================================
-# CONFIGURACIÓN DE CONSULTAS (solo tus 6 datos)
-# ==========================================================
+KEY_NAME = "P2P_DATA"
+
 QUERIES = [
     {"fiat": "VES", "asset": "USDT", "tradeType": "BUY", "payTypes": ["Banesco"],          "key": "VES_Banesco"},
     {"fiat": "VES", "asset": "USDT", "tradeType": "BUY", "payTypes": ["PagoMovil"],         "key": "VES_PagoMovil"},
@@ -42,15 +38,10 @@ IMPERSONATE_OPTIONS = ["chrome120", "chrome124", "chrome131"]
 
 
 def random_delay():
-    """Pausa aleatoria para no crear patrones detectables por Cloudflare."""
     time.sleep(random.uniform(2.5, 4.5))
 
 
 def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
-    """
-    Consulta Binance P2P con suplantación de huella TLS.
-    Reintenta hasta 3 veces con espera progresiva si falla.
-    """
     payload = {
         "page": 1,
         "rows": 20,
@@ -83,10 +74,8 @@ def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
                 if data.get("success") and data.get("data"):
                     return data
             elif response.status_code in [403, 429]:
-                # Bloqueo temporal o rate limit: espera más tiempo
                 time.sleep(10 * attempt)
                 continue
-
         except Exception:
             pass
 
@@ -97,10 +86,6 @@ def fetch_with_retry(fiat, asset, trade_type, pay_types, max_retries=3):
 
 
 def process_ads(raw_data):
-    """
-    Filtra anuncios de estafadores y calcula estadísticas de precios.
-    Solo acepta comerciantes con >=95% de completación y >=10 órdenes mensuales.
-    """
     ads = raw_data.get("data", [])
     if not ads:
         return None
@@ -126,7 +111,6 @@ def process_ads(raw_data):
 
     valid_prices.sort()
 
-    # Promedio recortado (elimina extremos para evitar outliers)
     if len(valid_prices) >= 4:
         trimmed = valid_prices[1:-1]
         avg_price = round(statistics.mean(trimmed), 2)
@@ -143,26 +127,31 @@ def process_ads(raw_data):
 
 
 def read_kv():
-    """Lee el JSON completo actual de Cloudflare KV."""
+    """Lee exclusivamente la clave P2P_DATA de Cloudflare KV."""
     url = (
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
-        f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/LATEST_PRICES"
+        f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/{KEY_NAME}"
     )
     headers = {"Authorization": f"Bearer {CF_API_TOKEN}"}
     try:
-        response = requests.get(url, headers=headers, timeout=10)
+        response = requests.get(url, headers=headers, timeout=12)
         if response.status_code == 200:
             return response.json()
-    except Exception:
-        pass
-    return None
+        elif response.status_code == 404:
+            return {}
+        else:
+            print(f"⚠️ Error al leer KV ({response.status_code}): {response.text}")
+            return None
+    except Exception as e:
+        print(f"⚠️ Error de red al leer KV: {e}")
+        return None
 
 
 def write_kv(data):
-    """Guarda el JSON completo en Cloudflare KV (1 sola escritura)."""
+    """Guarda exclusivamente en la clave P2P_DATA de Cloudflare KV."""
     url = (
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}"
-        f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/LATEST_PRICES"
+        f"/storage/kv/namespaces/{CF_KV_NAMESPACE_ID}/values/{KEY_NAME}"
     )
     headers = {
         "Authorization": f"Bearer {CF_API_TOKEN}",
@@ -176,7 +165,8 @@ def write_kv(data):
             timeout=15
         )
         return response.json().get("success", False)
-    except Exception:
+    except Exception as e:
+        print(f"🚨 Error escribiendo en KV: {e}")
         return False
 
 
@@ -189,28 +179,15 @@ def main():
         print("🚨 Faltan credenciales en GitHub Secrets.")
         return
 
-    # -------------------------------------------------------
-    # 1. Leer KV actual para conservar la sección del BCV
-    #    y los precios anteriores (anti-ceros)
-    # -------------------------------------------------------
-    existing = read_kv() or {}
-    existing_bcv = existing.get("bcv", None)
-    existing_prices = existing.get("prices", {})
+    # 1. Leer precios previos para no perderlos si un par falla
+    existing_kv = read_kv()
+    if existing_kv is None:
+        print("🛡️ Abortando por seguridad: no se pudo leer el estado actual.")
+        return
 
-    # -------------------------------------------------------
-    # 2. Construir el resultado partiendo de la base anterior
-    # -------------------------------------------------------
-    result = {
-        "success": True,
-        "updated_at": int(time.time()),
-        "updated_at_human": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
-        "bcv": existing_bcv,        # Sección BCV intacta
-        "prices": existing_prices   # Precios anteriores como base
-    }
+    current_prices = existing_kv.get("prices", {})
 
-    # -------------------------------------------------------
-    # 3. Consultar cada par de moneda y actualizar solo los frescos
-    # -------------------------------------------------------
+    # 2. Consultar Binance P2P
     ok = 0
     for q in QUERIES:
         key = q["key"]
@@ -220,26 +197,31 @@ def main():
         if raw:
             processed = process_ads(raw)
             if processed:
-                result["prices"][key] = processed
+                current_prices[key] = processed
                 ok += 1
                 print(f"   ✅ Mejor: {processed['best']} | Prom: {processed['avg']}")
             else:
-                print(f"   ⚠️ Sin anuncios calificados (se mantiene valor previo)")
+                print(f"   ⚠️ Sin anuncios calificados (se conserva valor previo)")
         else:
-            print(f"   ❌ Error de red (se mantiene valor previo)")
+            print(f"   ❌ Error de red (se conserva valor previo)")
 
         random_delay()
 
-    # -------------------------------------------------------
-    # 4. Guardar en KV
-    # -------------------------------------------------------
-    print(f"\n📊 P2P: {ok}/6 exitosas en este ciclo")
+    # 3. Guardar en Cloudflare KV
+    print(f"\n📊 P2P: {ok}/6 consultas exitosas")
 
-    if result["prices"] or result["bcv"]:
-        if write_kv(result):
-            print("🚀 Guardado exitoso (P2P actualizado, BCV protegido).")
+    payload = {
+        "success": True,
+        "updated_at": int(time.time()),
+        "updated_at_human": time.strftime('%Y-%m-%d %H:%M:%S UTC', time.gmtime()),
+        "prices": current_prices
+    }
+
+    if current_prices:
+        if write_kv(payload):
+            print("🚀 Guardado exitoso en Cloudflare KV (Clave: P2P_DATA).")
         else:
-            print("❌ Error al guardar en Cloudflare KV.")
+            print("❌ Error al guardar en KV.")
     else:
         print("⚠️ No hay datos para guardar.")
 
