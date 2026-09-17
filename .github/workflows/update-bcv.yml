@@ -2,14 +2,15 @@ name: Actualizar Tasa Oficial BCV
 
 on:
   # Horarios inteligentes en UTC (Venezuela = UTC-4)
-  schedule:
-    # Ventana tarde VET: 4PM-8PM = 20:00-00:00 UTC, cada 15 min (lun-vie)
-    - cron: "*/15 20-23 * * 1-5"
-    # Ventana mañana VET: 7AM-10AM = 11:00-14:00 UTC, cada 30 min (lun-vie)
-    - cron: "*/30 11-14 * * 1-5"
+schedule:
+    # Ventana tarde VET: 4PM-8PM = 20:00-23:59 UTC, cada 15 min (lun-vie)
+    # Desplazada 2 min para esquivar la congestion de GitHub
+    - cron: "2-59/15 20-23 * * 1-5"
+    # Ventana mañana VET: 7AM-10:30AM = 11:00-14:59 UTC, cada 30 min (lun-vie)
+    - cron: "2-59/30 11-14 * * 1-5"
     # Chequeo pasivo: cada 4 horas (fines de semana y noches)
-    - cron: "0 */4 * * *"
-
+    - cron: "2 */4 * * *"
+    
   # Disparo manual para pruebas
   workflow_dispatch:
 
